@@ -8,10 +8,6 @@ namespace Magento\Webapi\Model\Authorization;
 
 use Magento\Authorization\Model\UserContextInterface;
 use Magento\Framework\App\ObjectManager;
-use Magento\Framework\Exception\AuthorizationException;
-use Magento\Integration\Api\Exception\UserTokenException;
-use Magento\Integration\Api\UserTokenReaderInterface;
-use Magento\Integration\Api\UserTokenValidatorInterface;
 use Magento\Integration\Model\Oauth\Token;
 use Magento\Integration\Model\Oauth\TokenFactory;
 use Magento\Integration\Api\IntegrationServiceInterface;
@@ -56,14 +52,19 @@ class TokenUserContext implements UserContextInterface
     protected $integrationService;
 
     /**
-     * @var UserTokenReaderInterface
+     * @var DateTime
      */
-    private $userTokenReader;
+    private $dateTime;
 
     /**
-     * @var UserTokenValidatorInterface
+     * @var Date
      */
-    private $userTokenValidator;
+    private $date;
+
+    /**
+     * @var OauthHelper
+     */
+    private $oauthHelper;
 
     /**
      * Initialize dependencies.
@@ -74,8 +75,6 @@ class TokenUserContext implements UserContextInterface
      * @param DateTime|null $dateTime
      * @param Date|null $date
      * @param OauthHelper|null $oauthHelper
-     * @param UserTokenReaderInterface|null $tokenReader
-     * @param UserTokenValidatorInterface|null $tokenValidator
      */
     public function __construct(
         Request $request,
@@ -83,16 +82,20 @@ class TokenUserContext implements UserContextInterface
         IntegrationServiceInterface $integrationService,
         DateTime $dateTime = null,
         Date $date = null,
-        OauthHelper $oauthHelper = null,
-        ?UserTokenReaderInterface $tokenReader = null,
-        ?UserTokenValidatorInterface $tokenValidator = null
+        OauthHelper $oauthHelper = null
     ) {
         $this->request = $request;
         $this->tokenFactory = $tokenFactory;
         $this->integrationService = $integrationService;
-        $this->userTokenReader = $tokenReader ?? ObjectManager::getInstance()->get(UserTokenReaderInterface::class);
-        $this->userTokenValidator = $tokenValidator
-            ?? ObjectManager::getInstance()->get(UserTokenValidatorInterface::class);
+        $this->dateTime = $dateTime ?: ObjectManager::getInstance()->get(
+            DateTime::class
+        );
+        $this->date = $date ?: ObjectManager::getInstance()->get(
+            Date::class
+        );
+        $this->oauthHelper = $oauthHelper ?: ObjectManager::getInstance()->get(
+            OauthHelper::class
+        );
     }
 
     /**
@@ -111,6 +114,34 @@ class TokenUserContext implements UserContextInterface
     {
         $this->processRequest();
         return $this->userType;
+    }
+
+    /**
+     * Check if token is expired.
+     *
+     * @param Token $token
+     * @return bool
+     */
+    private function isTokenExpired(Token $token): bool
+    {
+        if ($token->getUserType() == UserContextInterface::USER_TYPE_ADMIN) {
+            $tokenTtl = $this->oauthHelper->getAdminTokenLifetime();
+        } elseif ($token->getUserType() == UserContextInterface::USER_TYPE_CUSTOMER) {
+            $tokenTtl = $this->oauthHelper->getCustomerTokenLifetime();
+        } else {
+            // other user-type tokens are considered always valid
+            return false;
+        }
+
+        if (empty($tokenTtl)) {
+            return false;
+        }
+
+        if ($this->dateTime->strToTime($token->getCreatedAt()) < ($this->date->gmtTimestamp() - $tokenTtl * 3600)) {
+            return true;
+        }
+
+        return false;
     }
 
     /**
@@ -143,21 +174,15 @@ class TokenUserContext implements UserContextInterface
         }
 
         $bearerToken = $headerPieces[1];
-        try {
-            $token = $this->userTokenReader->read($bearerToken);
-        } catch (UserTokenException $exception) {
+        $token = $this->tokenFactory->create()->loadByToken($bearerToken);
+
+        if (!$token->getId() || $token->getRevoked() || $this->isTokenExpired($token)) {
             $this->isRequestProcessed = true;
-            return;
-        }
-        try {
-            $this->userTokenValidator->validate($token);
-        } catch (AuthorizationException $exception) {
-            $this->isRequestProcessed = true;
+
             return;
         }
 
-        $this->userType = $token->getUserContext()->getUserType();
-        $this->userId = $token->getUserContext()->getUserId();
+        $this->setUserDataViaToken($token);
         $this->isRequestProcessed = true;
     }
 
@@ -166,8 +191,6 @@ class TokenUserContext implements UserContextInterface
      *
      * @param Token $token
      * @return void
-     * @deprecated Since tokens are handled with UserTokenReader now.
-     * @see TokenUserContext::processRequest()
      */
     protected function setUserDataViaToken(Token $token)
     {
